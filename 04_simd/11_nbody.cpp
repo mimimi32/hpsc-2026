@@ -33,10 +33,8 @@ int main() {
     __m512 r2 = _mm512_add_ps(_mm512_mul_ps(rx, rx),
                               _mm512_mul_ps(ry, ry));
 
-    // 1/r を rsqrt で計算(sqrtしてから割るより速い)
+    // 1/r を rsqrt で計算
     __m512 invr  = _mm512_rsqrt14_ps(r2);
-    // 1/r^3 = (1/r) * (1/r) * (1/r) ... ではなく
-    // 実は r2 から 1/r を作ったので 1/r^3 = invr * invr * invr
     __m512 invr3 = _mm512_mul_ps(_mm512_mul_ps(invr, invr), invr);
 
     // i != j のマスクを作る
