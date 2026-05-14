@@ -24,7 +24,6 @@ __global__ void count_buckets(const int *key, int *bucket, int n) {
 
 // ② 排他的プレフィックス和 (Hillis-Steele scan)
 // bucket[0..range-1] を入力として、offset[i] = bucket[0] + ... + bucket[i-1] を計算する
-// 注意: 1 ブロック内で完結させるため、range <= 1024 を前提とする
 __global__ void exclusive_scan(const int *bucket, int *offset, int range) {
   extern __shared__ int temp[];
   int i = threadIdx.x;
