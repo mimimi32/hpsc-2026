@@ -3,8 +3,8 @@
 #include <vector>
 
 int main() {
-  int n = 50;
-  int range = 5;
+  int n = 10000000;
+  int range = 1024;
   std::vector<int> key(n);
   for (int i=0; i<n; i++) {
     key[i] = rand() % range;

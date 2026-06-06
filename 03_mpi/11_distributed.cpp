@@ -10,7 +10,7 @@ struct Body
 
 int main(int argc, char **argv)
 {
-  const int N = 10000;
+  const int N = 20;
   MPI_Init(&argc, &argv);
   int size, rank;
   MPI_Comm_size(MPI_COMM_WORLD, &size);
