@@ -10,8 +10,8 @@ using namespace std;
 using namespace nvcuda;
 
 #define TILE_M 128
-#define TILE_N 128
-#define TILE_K 64
+#define TILE_N 256
+#define TILE_K 128
 #define PAD    8
 
 __device__ __forceinline__
@@ -57,7 +57,7 @@ __global__ void convert_inputs(const float *__restrict__ src_a,
   }
 }
 
-__global__ __launch_bounds__(512, 2)
+__global__ __launch_bounds__(1024, 1)
 void kernel(int dim_m, int dim_n, int dim_k,
             const half *__restrict__ d_a,
             const half *__restrict__ d_b,
@@ -74,9 +74,9 @@ void kernel(int dim_m, int dim_n, int dim_k,
   SharedB &sB = *reinterpret_cast<SharedB *>(
       smem + 2 * TILE_K * (TILE_M + PAD));
 
-  // Sixteen warps split a 128x128 CTA tile into 16x64 warp tiles.
-  const int wr = warp_id / 2;
-  const int wc = (warp_id % 2) * 4;
+  // Thirty-two warps split a 128x256 CTA tile into 16x64 warp tiles.
+  const int wr = warp_id / 4;
+  const int wc = (warp_id % 4) * 4;
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
   for (int c = 0; c < 4; c++)
@@ -199,7 +199,7 @@ int main(int argc, const char **argv) {
   double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
 
-  dim3 block(512);
+  dim3 block(1024);
   dim3 grid((m + TILE_M - 1) / TILE_M,
             (n + TILE_N - 1) / TILE_N);
   int convert_threads = 256;
@@ -230,7 +230,7 @@ int main(int argc, const char **argv) {
 
   double twmma = chrono::duration<double>(toc - tic).count() / Nt;
   double wmma_flops = double(num_flops) / twmma / 1.0e9;
-  printf("CUBLAS: %.2f Gflops, WMMA: %.2f Gflops\n",
+  printf("CUBLAS: %.2f Gflops, CUTLASS: %.2f Gflops\n",
          cublas_flops, wmma_flops);
 
   double err = 0;
