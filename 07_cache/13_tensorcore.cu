@@ -14,24 +14,26 @@ using namespace nvcuda;
 #define TILE_K 32
 #define PAD    8
 
-__global__ void kernel(int dim_m, int dim_n, int dim_k,
-                       const float *d_a, const float *d_b, float *d_c) {
+__global__ __launch_bounds__(512, 2)
+void kernel(int dim_m, int dim_n, int dim_k,
+            const float *__restrict__ d_a,
+            const float *__restrict__ d_b,
+            float *__restrict__ d_c) {
   const int om      = TILE_M * blockIdx.x;
   const int on      = TILE_N * blockIdx.y;
   const int tid     = threadIdx.x;
   const int warp_id = tid / 32;
 
   __shared__ half sA[2][TILE_K][TILE_M + PAD];
-  __shared__ half sB[2][TILE_K][TILE_N + PAD];
+  __shared__ half sB[2][TILE_N][TILE_K + PAD];
 
-  // Eight warps split a 128x128 CTA tile into 32x64 warp tiles.
-  const int wr = (warp_id / 2) * 2;
+  // Sixteen warps split a 128x128 CTA tile into 16x64 warp tiles.
+  const int wr = warp_id / 2;
   const int wc = (warp_id % 2) * 4;
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
-  for (int r = 0; r < 2; r++)
-    for (int c = 0; c < 4; c++)
-      wmma::fill_fragment(acc[r][c], 0.0f);
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+  for (int c = 0; c < 4; c++)
+    wmma::fill_fragment(acc[c], 0.0f);
 
   // Load the first K tile. A is vectorized along M, B along K.
   int buf = 0;
@@ -50,10 +52,10 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
     int kk = (v % (TILE_K / 4)) * 4;
     float4 x = *reinterpret_cast<const float4 *>(
         &d_b[(on + col) * dim_k + kk]);
-    sB[0][kk    ][col] = __float2half(x.x);
-    sB[0][kk + 1][col] = __float2half(x.y);
-    sB[0][kk + 2][col] = __float2half(x.z);
-    sB[0][kk + 3][col] = __float2half(x.w);
+    *reinterpret_cast<half2 *>(&sB[0][col][kk]) =
+        __floats2half2_rn(x.x, x.y);
+    *reinterpret_cast<half2 *>(&sB[0][col][kk + 2]) =
+        __floats2half2_rn(x.z, x.w);
   }
   __syncthreads();
 
@@ -76,28 +78,25 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
         int kk = (v % (TILE_K / 4)) * 4;
         float4 x = *reinterpret_cast<const float4 *>(
             &d_b[(on + col) * dim_k + k + TILE_K + kk]);
-        sB[nb][kk    ][col] = __float2half(x.x);
-        sB[nb][kk + 1][col] = __float2half(x.y);
-        sB[nb][kk + 2][col] = __float2half(x.z);
-        sB[nb][kk + 3][col] = __float2half(x.w);
+        *reinterpret_cast<half2 *>(&sB[nb][col][kk]) =
+            __floats2half2_rn(x.x, x.y);
+        *reinterpret_cast<half2 *>(&sB[nb][col][kk + 2]) =
+            __floats2half2_rn(x.z, x.w);
       }
     }
 
     for (int kk = 0; kk < TILE_K; kk += 16) {
       wmma::fragment<wmma::matrix_a, 16, 16, 16, half,
-                     wmma::col_major> a_frag[2];
-      for (int r = 0; r < 2; r++)
-        wmma::load_matrix_sync(
-            a_frag[r], &sA[buf][kk][(wr + r) * 16], TILE_M + PAD);
+                     wmma::col_major> a_frag;
+      wmma::load_matrix_sync(
+          a_frag, &sA[buf][kk][wr * 16], TILE_M + PAD);
 
-      // Reuse each B fragment for both 16-row output tiles.
       for (int c = 0; c < 4; c++) {
         wmma::fragment<wmma::matrix_b, 16, 16, 16, half,
-                       wmma::row_major> b_frag;
+                       wmma::col_major> b_frag;
         wmma::load_matrix_sync(
-            b_frag, &sB[buf][kk][(wc + c) * 16], TILE_N + PAD);
-        for (int r = 0; r < 2; r++)
-          wmma::mma_sync(acc[r][c], a_frag[r], b_frag, acc[r][c]);
+            b_frag, &sB[buf][(wc + c) * 16][kk], TILE_K + PAD);
+        wmma::mma_sync(acc[c], a_frag, b_frag, acc[c]);
       }
     }
 
@@ -105,15 +104,14 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
     buf = nb;
   }
 
-  for (int r = 0; r < 2; r++)
-    for (int c = 0; c < 4; c++) {
-      int cm = om + (wr + r) * 16;
-      int cn = on + (wc + c) * 16;
-      if (cm < dim_m && cn < dim_n)
-        wmma::store_matrix_sync(
-            &d_c[cn * dim_m + cm], acc[r][c], dim_m,
-            wmma::mem_col_major);
-    }
+  for (int c = 0; c < 4; c++) {
+    int cm = om + wr * 16;
+    int cn = on + (wc + c) * 16;
+    if (cm < dim_m && cn < dim_n)
+      wmma::store_matrix_sync(
+          &d_c[cn * dim_m + cm], acc[c], dim_m,
+          wmma::mem_col_major);
+  }
 }
 
 int main(int argc, const char **argv) {
@@ -161,7 +159,7 @@ int main(int argc, const char **argv) {
   double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
 
-  dim3 block(256);
+  dim3 block(512);
   dim3 grid((m + TILE_M - 1) / TILE_M,
             (n + TILE_N - 1) / TILE_N);
 
