@@ -3,61 +3,101 @@
 #include <random>
 #include <stdint.h>
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <mma.h>
 #include <chrono>
 using namespace std;
 using namespace nvcuda;
 
-#define TILE 128
-#define PAD  8   // avoid shared memory bank conflicts
+#define TILE_M 128
+#define TILE_N 128
+#define TILE_K 32
+#define PAD    8
 
 __global__ void kernel(int dim_m, int dim_n, int dim_k,
-                       float *d_a, float *d_b, float *d_c) {
-  const int om      = TILE * blockIdx.x;
-  const int on      = TILE * blockIdx.y;
-  const int i       = threadIdx.x;       // 0..127
-  const int warp_id = i / 32;            // 0..3
+                       const float *d_a, const float *d_b, float *d_c) {
+  const int om      = TILE_M * blockIdx.x;
+  const int on      = TILE_N * blockIdx.y;
+  const int tid     = threadIdx.x;
+  const int warp_id = tid / 32;
 
-  // Double-buffered shared memory with padding
-  __shared__ half sA[2][16][TILE + PAD];
-  __shared__ half sB[2][16][TILE + PAD];
+  __shared__ half sA[2][TILE_K][TILE_M + PAD];
+  __shared__ half sB[2][TILE_K][TILE_N + PAD];
 
-  // Each warp owns 32 rows x 128 cols of the 128x128 output tile
-  // warp 0: rows 0-31, warp 1: rows 32-63, warp 2: rows 64-95, warp 3: rows 96-127
-  const int wr = warp_id * 2;  // first row-tile index (each tile = 16 rows)
+  // Eight warps split a 128x128 CTA tile into 32x64 warp tiles.
+  const int wr = (warp_id / 2) * 2;
+  const int wc = (warp_id % 2) * 4;
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][8];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
   for (int r = 0; r < 2; r++)
-    for (int c = 0; c < 8; c++)
+    for (int c = 0; c < 4; c++)
       wmma::fill_fragment(acc[r][c], 0.0f);
 
-  // Load first k-slab into buffer 0
+  // Load the first K tile. A is vectorized along M, B along K.
   int buf = 0;
-  for (int j = 0; j < 16; j++) {
-    sA[0][j][i] = __float2half(d_a[j * dim_m + om + i]);
-    sB[0][j][i] = __float2half(d_b[(on + i) * dim_k + j]);
+  for (int v = tid; v < TILE_K * TILE_M / 4; v += blockDim.x) {
+    int kk = v / (TILE_M / 4);
+    int row = (v % (TILE_M / 4)) * 4;
+    float4 x = *reinterpret_cast<const float4 *>(
+        &d_a[kk * dim_m + om + row]);
+    *reinterpret_cast<half2 *>(&sA[0][kk][row]) =
+        __floats2half2_rn(x.x, x.y);
+    *reinterpret_cast<half2 *>(&sA[0][kk][row + 2]) =
+        __floats2half2_rn(x.z, x.w);
+  }
+  for (int v = tid; v < TILE_N * TILE_K / 4; v += blockDim.x) {
+    int col = v / (TILE_K / 4);
+    int kk = (v % (TILE_K / 4)) * 4;
+    float4 x = *reinterpret_cast<const float4 *>(
+        &d_b[(on + col) * dim_k + kk]);
+    sB[0][kk    ][col] = __float2half(x.x);
+    sB[0][kk + 1][col] = __float2half(x.y);
+    sB[0][kk + 2][col] = __float2half(x.z);
+    sB[0][kk + 3][col] = __float2half(x.w);
   }
   __syncthreads();
 
-  for (int k = 0; k < dim_k; k += 16) {
+  for (int k = 0; k < dim_k; k += TILE_K) {
     int nb = 1 - buf;
 
-    // Prefetch next k-slab while computing current (double buffering)
-    if (k + 16 < dim_k) {
-      for (int j = 0; j < 16; j++) {
-        sA[nb][j][i] = __float2half(d_a[(k+16+j) * dim_m + om + i]);
-        sB[nb][j][i] = __float2half(d_b[(on + i) * dim_k + k+16+j]);
+    if (k + TILE_K < dim_k) {
+      for (int v = tid; v < TILE_K * TILE_M / 4; v += blockDim.x) {
+        int kk = v / (TILE_M / 4);
+        int row = (v % (TILE_M / 4)) * 4;
+        float4 x = *reinterpret_cast<const float4 *>(
+            &d_a[(k + TILE_K + kk) * dim_m + om + row]);
+        *reinterpret_cast<half2 *>(&sA[nb][kk][row]) =
+            __floats2half2_rn(x.x, x.y);
+        *reinterpret_cast<half2 *>(&sA[nb][kk][row + 2]) =
+            __floats2half2_rn(x.z, x.w);
+      }
+      for (int v = tid; v < TILE_N * TILE_K / 4; v += blockDim.x) {
+        int col = v / (TILE_K / 4);
+        int kk = (v % (TILE_K / 4)) * 4;
+        float4 x = *reinterpret_cast<const float4 *>(
+            &d_b[(on + col) * dim_k + k + TILE_K + kk]);
+        sB[nb][kk    ][col] = __float2half(x.x);
+        sB[nb][kk + 1][col] = __float2half(x.y);
+        sB[nb][kk + 2][col] = __float2half(x.z);
+        sB[nb][kk + 3][col] = __float2half(x.w);
       }
     }
 
-    // Compute using current buffer: 2 row-tiles x 8 col-tiles per warp
-    for (int r = 0; r < 2; r++) {
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-      wmma::load_matrix_sync(a_frag, &sA[buf][0][(wr+r)*16], TILE+PAD);
-      for (int c = 0; c < 8; c++) {
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-        wmma::load_matrix_sync(b_frag, &sB[buf][0][c*16], TILE+PAD);
-        wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
+    for (int kk = 0; kk < TILE_K; kk += 16) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, half,
+                     wmma::col_major> a_frag[2];
+      for (int r = 0; r < 2; r++)
+        wmma::load_matrix_sync(
+            a_frag[r], &sA[buf][kk][(wr + r) * 16], TILE_M + PAD);
+
+      // Reuse each B fragment for both 16-row output tiles.
+      for (int c = 0; c < 4; c++) {
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half,
+                       wmma::row_major> b_frag;
+        wmma::load_matrix_sync(
+            b_frag, &sB[buf][kk][(wc + c) * 16], TILE_N + PAD);
+        for (int r = 0; r < 2; r++)
+          wmma::mma_sync(acc[r][c], a_frag[r], b_frag, acc[r][c]);
       }
     }
 
@@ -65,12 +105,14 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
     buf = nb;
   }
 
-  // Write accumulators to C
   for (int r = 0; r < 2; r++)
-    for (int c = 0; c < 8; c++) {
-      int cm = om + (wr+r)*16, cn = on + c*16;
+    for (int c = 0; c < 4; c++) {
+      int cm = om + (wr + r) * 16;
+      int cn = on + (wc + c) * 16;
       if (cm < dim_m && cn < dim_n)
-        wmma::store_matrix_sync(&d_c[cn * dim_m + cm], acc[r][c], dim_m, wmma::mem_col_major);
+        wmma::store_matrix_sync(
+            &d_c[cn * dim_m + cm], acc[r][c], dim_m,
+            wmma::mem_col_major);
     }
 }
 
@@ -119,8 +161,9 @@ int main(int argc, const char **argv) {
   double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
 
-  dim3 block(TILE);
-  dim3 grid((m+TILE-1)/TILE, (n+TILE-1)/TILE);
+  dim3 block(256);
+  dim3 grid((m + TILE_M - 1) / TILE_M,
+            (n + TILE_N - 1) / TILE_N);
 
   tic = chrono::steady_clock::now();
   for (int i = 0; i < Nt+2; i++) {
@@ -130,9 +173,9 @@ int main(int argc, const char **argv) {
   }
   toc = chrono::steady_clock::now();
 
-  double tcutlass = chrono::duration<double>(toc - tic).count() / Nt;
-  double cutlass_flops = double(num_flops) / tcutlass / 1.0e9;
-  printf("CUBLAS: %.2f Gflops, CUTLASS: %.2f Gflops\n", cublas_flops, cutlass_flops);
+  double twmma = chrono::duration<double>(toc - tic).count() / Nt;
+  double wmma_flops = double(num_flops) / twmma / 1.0e9;
+  printf("CUBLAS: %.2f Gflops, WMMA: %.2f Gflops\n", cublas_flops, wmma_flops);
 
   double err = 0;
   for (int i=0; i<n; i++)
