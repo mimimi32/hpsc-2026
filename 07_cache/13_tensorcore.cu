@@ -11,7 +11,7 @@ using namespace nvcuda;
 
 #define TILE_M 128
 #define TILE_N 256
-#define TILE_K 128
+#define TILE_K 64
 #define PAD    8
 
 __device__ __forceinline__
